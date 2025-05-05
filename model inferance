@@ -1,0 +1,109 @@
+import cv2
+import torch
+from threading import Lock
+from pal.products.qcar import QCarRealSense
+from nets import YOLOv8  # Your existing network class
+
+class QCarPerceptionSystem:
+    def __init__(self):
+        # Sensor setup
+        self.camera = QCarRealSense(mode='RGB&DEPTH', 
+                                  frameWidthRGB=640,
+                                  frameHeightRGB=480)
+        
+        # AI Models
+        self.detector = YOLOv8(imageWidth=640, imageHeight=480)
+        self.cone_model = YOLO('Cone.pt')  # Specialized cone detector
+        
+        # Thread safety
+        self.lock = Lock()
+        self.current_objects = []
+        self.running = False
+
+    def start(self):
+        """Start the perception thread"""
+        self.running = True
+        Thread(target=self._perception_loop, daemon=True).start()
+
+    def _perception_loop(self):
+        while self.running:
+            try:
+                # Get sensor data
+                self.camera.read_RGB()
+                self.camera.read_DEPTH()
+                
+                # Process with both models
+                rgb_img = self.camera.imageBufferRGB
+                depth_img = self.camera.imageBufferDepth
+                
+                # Main detection
+                self.detector.predict(rgb_img)
+                results = self.detector.post_processing(
+                    alignedDepth=depth_img,
+                    clippingDistance=5.0
+                )
+                
+                # Cone-specific detection (higher confidence)
+                cones = self.cone_model(rgb_img, conf=0.7)
+                
+                # Thread-safe update
+                with self.lock:
+                    self.current_objects = results + self._process_cones(cones)
+                    
+            except Exception as e:
+                print(f"Perception error: {e}")
+
+    def _process_cones(self, cone_results):
+        """Format cone detections to match main detector output"""
+        cones = []
+        for result in cone_results:
+            for box in result.boxes:
+                cones.append({
+                    'type': 'cone',
+                    'class': 'traffic_cone',
+                    'confidence': float(box.conf),
+                    'bbox': box.xyxy[0].cpu().numpy(),
+                    'distance': self._estimate_cone_distance(box, depth_img)
+                })
+        return cones
+
+    def get_objects(self):
+        """Thread-safe access to detected objects"""
+        with self.lock:
+            return self.current_objects.copy()
+
+    def visualize(self):
+        """Generate debug visualization"""
+        img = self.detector.post_process_render(showFPS=True)
+        
+        # Add cone detections
+        for cone in [o for o in self.current_objects if o['type'] == 'cone']:
+            x1, y1, x2, y2 = cone['bbox']
+            cv2.rectangle(img, (x1,y1), (x2,y2), (0,255,255), 2)
+            cv2.putText(img, f"Cone {cone['distance']:.1f}m", 
+                       (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                       (0,255,255), 2)
+        return img
+
+# Usage Example
+if __name__ == "__main__":
+    perception = QCarPerceptionSystem()
+    perception.start()
+    
+    try:
+        while True:
+            objects = perception.get_objects()
+            
+            # Reaction logic
+            for obj in objects:
+                if obj['class'] == 'stop sign' and obj['distance'] < 3.0:
+                    print("STOP SIGN AHEAD - BRAKING!")
+                elif 'traffic_light' in obj and 'red' in obj['color']:
+                    print("RED LIGHT DETECTED")
+            
+            # Display (optional)
+            cv2.imshow('Perception', perception.visualize())
+            cv2.waitKey(1)
+            
+    except KeyboardInterrupt:
+        perception.running = False
